@@ -1,0 +1,333 @@
+import numpy as np
+import time
+import os
+import matplotlib
+matplotlib.use("Agg")   # 非GUI环境安全输出
+import matplotlib.pyplot as plt
+from simulation_and_control import pb, MotorCommands, PinWrapper, feedback_lin_ctrl, SinusoidalReference 
+import xml.etree.ElementTree as ET
+
+# =========================
+# ===== Helper functions ==
+# =========================
+
+def rpy_to_R(roll, pitch, yaw):
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rz = np.array([[cy, -sy, 0],[sy, cy, 0],[0, 0, 1]])
+    Ry = np.array([[cp, 0, sp],[0, 1, 0],[-sp, 0, cp]])
+    Rx = np.array([[1, 0, 0],[0, cr, -sr],[0, sr, cr]])
+    return Rz @ Ry @ Rx  # XYZ fixed-axis roll->pitch->yaw
+
+def extract_link10_from_urdf(urdf_path, link_name):
+    """Return [m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz] in the LINK frame."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    link = None
+    for lk in root.findall('link'):
+        if lk.get('name') == link_name:
+            link = lk
+            break
+    if link is None:
+        raise ValueError(f"Link '{link_name}' not found in URDF.")
+
+    inertial = link.find('inertial')
+    mass_tag = inertial.find('mass')
+    m = float(mass_tag.attrib['value'])
+
+    origin = inertial.find('origin')
+    if origin is not None:
+        xyz = [float(v) for v in origin.attrib.get('xyz', '0 0 0').split()]
+        rpy = [float(v) for v in origin.attrib.get('rpy', '0 0 0').split()]
+    else:
+        xyz = [0.0, 0.0, 0.0]; rpy = [0.0, 0.0, 0.0]
+    cx, cy, cz = xyz
+    R_li = rpy_to_R(*rpy)
+
+    I = inertial.find('inertia').attrib
+    I_in = np.array([[float(I['ixx']), float(I['ixy']), float(I['ixz'])],
+                     [float(I['ixy']), float(I['iyy']), float(I['iyz'])],
+                     [float(I['ixz']), float(I['iyz']), float(I['izz'])]])
+    I_link = R_li @ I_in @ R_li.T
+    Ixx, Ixy, Ixz = I_link[0,0], I_link[0,1], I_link[0,2]
+    Iyy, Iyz, Izz = I_link[1,1], I_link[1,2], I_link[2,2]
+    return np.array([m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz], dtype=float)
+
+def build_full_param_vector(n_dof, per_link_params):
+    a_full = np.zeros(10 * n_dof)
+    for link_idx, a10 in per_link_params.items():
+        s = 10*(link_idx-1); a_full[s:s+10] = np.asarray(a10).reshape(10,)
+    return a_full
+
+def regression_metrics(y, y_hat, p, has_intercept=False):
+    """Return RSS, TSS, R2, R2_adj, F-stat with consistent DOF."""
+    M = y.size
+    residual = y - y_hat
+    RSS = float(residual @ residual)
+    TSS = float(((y - y.mean()) ** 2).sum()) if M > 0 else np.nan
+    R2 = 1.0 - (RSS / TSS if TSS > 0 else np.nan)
+    df_resid = max(M - p - (1 if has_intercept else 0), 1)
+    df_adj_den = max(M - (1 if has_intercept else 0), 1)
+    R2_adj = 1.0 - ((RSS / df_resid) / (TSS / df_adj_den) if TSS > 0 else np.nan)
+    SSR = max(TSS - RSS, 0.0)
+    num = (SSR / max(p,1))
+    den = (RSS / df_resid)
+    F = (num / den) if den > 0 else np.nan
+    return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F, "M": M, "p": p}
+
+# =========================
+# ========   MAIN   =======
+# =========================
+
+def main():
+    # --- 仿真初始化 ---
+    conf_file_name = "pandaconfig.json"
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    sim = pb.SimInterface(conf_file_name, conf_file_path_ext=cur_dir)
+
+    # 关节、动力学模型
+    ext_names = sim.getNameActiveJoints()
+    ext_names = np.expand_dims(np.array(ext_names), axis=0)
+    source_names = ["pybullet"]
+    dyn_model = PinWrapper(conf_file_name, "pybullet", ext_names, source_names, False, 0, cur_dir)
+    num_joints = dyn_model.getNumberofActuatedJoints()
+
+    print(f"Initial joint angles: {sim.GetInitMotorAngles()}")
+
+    # --- 正弦参考 ---
+    amplitudes = [np.pi/4, np.pi/6, np.pi/4, np.pi/4, np.pi/4, np.pi/4, np.pi/4]
+    frequencies = [0.4, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4]
+    amplitude = np.array(amplitudes)
+    frequency = np.array(frequencies)
+    ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles())
+
+    # --- 仿真参数 ---
+    time_step = sim.GetTimeStep()
+    current_time = 0.0
+    max_time = 10.0
+    cmd = MotorCommands()
+    kp = 1000
+    kd = 100
+
+    # --- 数据缓存 ---
+    tau_mes_all = []      # list of (n,)
+    regressor_all = []    # list of (n, 10n)
+    times = []
+    last_print_sec = -1   # 每1s打印一次
+
+    # --- 主循环：采集 τ 与 Y ---
+    while current_time < max_time:
+        q_mes = sim.GetMotorAngles(0)
+        qd_mes = sim.GetMotorVelocities(0)
+        qdd_mes = sim.ComputeMotorAccelerationTMinusOne(0)
+
+        q_d, qd_d = ref.get_values(current_time)
+        tau_cmd = feedback_lin_ctrl(dyn_model, q_mes, qd_mes, q_d, qd_d, kp, kd)
+        cmd.SetControlCmd(tau_cmd, ["torque"]*7)
+        sim.Step(cmd, "torque")
+
+        tau_mes = sim.GetMotorTorques(0)
+        Y_t = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)  # (7, 70)
+
+        regressor_all.append(Y_t)
+        tau_mes_all.append(np.asarray(tau_mes))
+        times.append(current_time)
+
+        # 每 1s 打印一次
+        cur_sec = int(current_time)
+        if cur_sec != last_print_sec:
+            print(f"Sim time: {cur_sec}s")
+            last_print_sec = cur_sec
+
+        # 退出键
+        keys = sim.GetPyBulletClient().getKeyboardEvents()
+        qKey = ord('q')
+        if qKey in keys and keys[qKey] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
+            break
+
+        current_time += time_step
+
+    # --- 安全检查 ---
+    if len(regressor_all) == 0:
+        print("No data collected. Exiting.")
+        return
+
+    # --- 去掉前 1s 预热样本 ---
+    N_warm = int(1.0 / time_step)
+    regressor_all = regressor_all[N_warm:]
+    tau_mes_all   = tau_mes_all[N_warm:]
+    times         = times[N_warm:]
+
+    n = num_joints
+    Y_stack = np.vstack(regressor_all)      # (T*n, 10n)
+    tau_stack = np.hstack(tau_mes_all)      # (T*n,)
+
+    # --- 读取 URDF 真值 ---
+    urdf_path = os.path.join(cur_dir, "models", "panda_description", "panda.urdf")
+    link_names = [f"panda_link{i}" for i in range(1,8)]
+    true_params_all = {i: extract_link10_from_urdf(urdf_path, link_names[i-1]) for i in range(1,8)}
+    a_true_all = build_full_param_vector(n, true_params_all)
+
+    # ============================================================
+    # ===================  PART 2: 全部参数  ======================
+    # ============================================================
+    print("\n" + "="*72)
+    print("PART 2: Estimating ALL links (1..7) parameters simultaneously")
+    print("="*72)
+
+    XtX_all = Y_stack.T @ Y_stack
+    condY = np.linalg.cond(XtX_all)
+    lam_all = 1e-6 if condY < 1e6 else 1e-4
+    a_hat_all = np.linalg.solve(XtX_all + lam_all*np.eye(XtX_all.shape[0]), Y_stack.T @ tau_stack)
+
+    print(f"[diag] cond(Y^T Y) = {condY:.3e}   ridge λ = {lam_all}")
+
+    # 误差（全部70维）
+    abs_err_all = np.abs(a_hat_all - a_true_all)
+    rel_err_all = np.where(a_true_all != 0, 100*np.abs((a_hat_all - a_true_all)/a_true_all), np.nan)
+
+    print("\nPer-link error summary (|abs| and rel % by link, grouped in chunks of 10):")
+    per_link_mean_rel = []
+    for i in range(1, 8):
+        s = 10*(i-1); e = 10*i
+        abs_err_i = abs_err_all[s:e]
+        rel_err_i = rel_err_all[s:e]
+        per_link_mean_rel.append(np.nanmean(rel_err_i))
+        print(f"\nLink {i}:")
+        print("  abs error: ", np.round(abs_err_i, 6))
+        print("  rel  %   : ", np.round(rel_err_i, 2))
+        print(f"  mean |rel|%: {np.nanmean(rel_err_i):.2f}   max |rel|%: {np.nanmax(rel_err_i):.2f}")
+
+    # Torque 预测与指标（全部参数）
+    tau_pred_all = Y_stack @ a_hat_all
+    rmse_all = float(np.sqrt(np.mean((tau_pred_all - tau_stack)**2)))
+    mets_all = regression_metrics(tau_stack, tau_pred_all, p=Y_stack.shape[1], has_intercept=False)
+    print(f"\n[Part 2] Torque RMSE = {rmse_all:.6f}")
+    print(f"[Part 2] R2 = {mets_all['R2']:.6f}  R2_adj = {mets_all['R2_adj']:.6f}  F = {mets_all['F']:.3f}")
+
+    # 图：Part2 torque 实测 vs 预测
+    tau_true_mat = np.vstack(tau_mes_all)                         # (T, 7)
+    tau_pred_full_mat = np.vstack([Yt @ a_hat_all for Yt in regressor_all])
+    t_axis = np.array(times[:tau_true_mat.shape[0]])
+
+    figp2, axp2 = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+    for j in range(7):
+        ax = axp2[j]
+        ax.plot(t_axis, tau_true_mat[:, j], label=f"τ{j+1} meas")
+        ax.plot(t_axis, tau_pred_full_mat[:, j], "--", label=f"τ{j+1} pred (full)")
+        ax.set_ylabel(f"J{j+1}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right", ncol=2, fontsize=8)
+    axp2[-1].set_xlabel("Time [s]")
+    figp2.suptitle("Part 2: Torque prediction (all 70 params) vs measured")
+    plt.tight_layout()
+    plt.savefig("part2_torque.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part2_torque.png"))
+
+    # 图：Part2 每个 link 的平均相对误差
+    figp2b, axp2b = plt.subplots(figsize=(8,4))
+    axp2b.bar(np.arange(1,8), per_link_mean_rel)
+    axp2b.set_xlabel("Link index")
+    axp2b.set_ylabel("Mean relative error (%)")
+    axp2b.set_title("Part 2: Mean relative parameter error per link")
+    axp2b.set_xticks(np.arange(1,8))
+    axp2b.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("part2_link_mean_rel_errors.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part2_link_mean_rel_errors.png"))
+
+    # ============================================================
+    # ===================  PART 1: 仅 Link 7  =====================
+    # ============================================================
+    print("\n" + "="*72)
+    print("PART 1: Estimating ONLY link 7 (links 1..6 known)")
+    print("="*72)
+
+    # 构造已知参数向量（1..6 从URDF，7 置0）
+    per_link_params_known = {i: true_params_all[i] for i in range(1, 7)}
+    a_known_full = build_full_param_vector(n, per_link_params_known)
+
+    s7, e7 = 10*(7-1), 10*(7-1)+10
+    r = tau_stack - (Y_stack @ a_known_full)     # 去掉 1..6 贡献
+    X7 = Y_stack[:, s7:e7]                       # 只保留 link7 的10列
+
+    XtX7 = X7.T @ X7
+    cond7 = np.linalg.cond(XtX7)
+    lam7 = 1e-6 if cond7 < 1e6 else 1e-4
+    a7_hat = np.linalg.solve(XtX7 + lam7*np.eye(10), X7.T @ r)
+
+    a7_true = true_params_all[7]
+    abs_err7 = np.abs(a7_hat - a7_true)
+    rel_err7 = np.where(a7_true != 0, 100*np.abs((a7_hat - a7_true)/a7_true), np.nan)
+
+    print(f"[diag] cond(X7^T X7) = {cond7:.3e}   ridge λ = {lam7}")
+    print("\n[Part1] link7 params:")
+    print("  a7_true:", np.round(a7_true, 6))
+    print("  a7_hat :", np.round(a7_hat, 6))
+    print("  abs err:", np.round(abs_err7, 6))
+    print("  mean |rel|% = {:.2f}   max |rel|% = {:.2f}".format(np.nanmean(rel_err7), np.nanmax(rel_err7)))
+
+    # 用 Part1 的 a_full_hat 做力矩预测与指标
+    a_full_hat = a_known_full.copy()
+    a_full_hat[s7:e7] = a7_hat
+    tau_hat_part1 = Y_stack @ a_full_hat
+    rmse_part1 = float(np.sqrt(np.mean((tau_hat_part1 - tau_stack)**2)))
+    mets1 = regression_metrics(tau_stack, tau_hat_part1, p=10, has_intercept=False)
+    print(f"\n[Part 1] Torque RMSE = {rmse_part1:.6f}")
+    print(f"[Part 1] R2 = {mets1['R2']:.6f}  R2_adj = {mets1['R2_adj']:.6f}  F = {mets1['F']:.3f}")
+
+    # 图：Link7 真值 vs 估计
+    labels = [f"p{i+1}" for i in range(10)]
+    x = np.arange(10); width = 0.35
+    fig1, ax1 = plt.subplots(figsize=(10,4))
+    ax1.bar(x - width/2, a7_true, width, label="True")
+    ax1.bar(x + width/2, a7_hat,  width, label="Estimated")
+    ax1.set_xticks(x); ax1.set_xticklabels(labels)
+    ax1.set_title("Link 7 Parameters: True vs Estimated")
+    ax1.grid(True, alpha=0.3); ax1.legend()
+    plt.tight_layout()
+    plt.savefig("link7_param_compare.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("link7_param_compare.png"))
+
+    # 图：Link7 绝对误差
+    fig2, ax2 = plt.subplots(figsize=(10,3.2))
+    ax2.bar(x, abs_err7)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels)
+    ax2.set_title("Link 7 Absolute Parameter Errors")
+    ax2.set_ylabel("|Error|"); ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("link7_param_errors.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("link7_param_errors.png"))
+
+    # 图：Part1 torque 实测/预测/误差
+    tau_mat  = np.vstack(tau_mes_all)                         # (T, 7)
+    uhat_mat = np.vstack([Yt @ a_full_hat for Yt in regressor_all])
+    err_mat  = uhat_mat - tau_mat
+    t_axis1 = np.array(times[:tau_mat.shape[0]])
+
+    fig3, axes = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+    for j in range(7):
+        ax = axes[j]
+        ax.plot(t_axis1, tau_mat[:, j], label=f"τ{j+1} meas")
+        ax.plot(t_axis1, uhat_mat[:, j], linestyle="--", label=f"τ{j+1} pred")
+        ax.plot(t_axis1, err_mat[:, j], linestyle=":", label=f"error τ{j+1}")
+        ax.set_ylabel(f"J{j+1}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right", ncol=3, fontsize=8)
+    axes[-1].set_xlabel("Time [s]")
+    fig3.suptitle("Part 1: Torque prediction & error (Link 7 only)")
+    plt.tight_layout()
+    plt.savefig("part1_torque.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part1_torque.png"))
+
+    # --- 摘要 ---
+    print("\n===== SUMMARY =====")
+    print(f"Part 1: Link7 mean |rel|% = {np.nanmean(rel_err7):.2f}    RMSE = {rmse_part1:.6f}")
+    print(f"Part 2: All-links mean |rel|% (avg over links) = {np.nanmean(per_link_mean_rel):.2f}    RMSE = {rmse_all:.6f}")
+    print("Saved figures: link7_param_compare.png, link7_param_errors.png, part1_torque.png, part2_torque.png, part2_link_mean_rel_errors.png")
+
+if __name__ == '__main__':
+    main()
