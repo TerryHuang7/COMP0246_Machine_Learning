@@ -76,6 +76,9 @@ def regression_metrics(y, y_hat, p, has_intercept=False):
     F = (num / den) if den > 0 else np.nan
     return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F, "M": M, "p": p}
 
+def calculate_rmse(y_true, y_pred):
+    return float(np.sqrt(np.mean((y_true - y_pred)**2)))
+
 # =========================
 # ========   MAIN   =======
 # =========================
@@ -158,16 +161,127 @@ def main():
     regressor_all = regressor_all[N_warm:]
     tau_mes_all   = tau_mes_all[N_warm:]
     times         = times[N_warm:]
+    print(f"Data collection complete. Dropped {N_warm} warm-up samples. Using {len(times)} samples.")
 
     n = num_joints
     Y_stack = np.vstack(regressor_all)      # (T*n, 10n)
     tau_stack = np.hstack(tau_mes_all)      # (T*n,)
+    
+    # --- 转换为 (T, n) 格式，用于绘图 ---
+    tau_true_mat = np.vstack(tau_mes_all) # (T, 7)
+    t_axis = np.array(times)
 
     # --- 读取 URDF 真值 ---
+    # 修正URDF路径使其更稳健
     urdf_path = os.path.join(cur_dir, "models", "panda_description", "panda.urdf")
+    if not os.path.exists(urdf_path):
+        # 备用路径，以防 'models' 不在脚本同级
+        urdf_path = os.path.join(cur_dir, "..", "models", "panda_description", "panda.urdf")
+        if not os.path.exists(urdf_path):
+             # 尝试 original_terry_test.py 中的路径
+             urdf_path = "LAB_SESSION_COMP_0245_2025_PUBLIC/week_1_2/models/panda_description/panda.urdf"
+             if not os.path.exists(urdf_path):
+                 raise FileNotFoundError("Could not find panda.urdf. Please check paths.")
+    
+    print(f"Loading true parameters from: {urdf_path}")
     link_names = [f"panda_link{i}" for i in range(1,8)]
     true_params_all = {i: extract_link10_from_urdf(urdf_path, link_names[i-1]) for i in range(1,8)}
     a_true_all = build_full_param_vector(n, true_params_all)
+
+    # --- 提前计算 URDF 真实力矩 (Part 1 和 Part 2 绘图都需要) ---
+    tau_urdf_stack = Y_stack @ a_true_all
+    tau_urdf_mat = np.vstack([Yt @ a_true_all for Yt in regressor_all]) # (T, 7)
+
+    # ============================================================
+    # ===================  PART 1: 仅 Link 7  =====================
+    # ============================================================
+    print("\n" + "="*72)
+    print("PART 1: Estimating ONLY link 7 (links 1..6 known)")
+    print("="*72)
+
+    # 构造已知参数向量（1..6 从URDF，7 置0）
+    per_link_params_known = {i: true_params_all[i] for i in range(1, 7)}
+    a_known_full = build_full_param_vector(n, per_link_params_known)
+
+    s7, e7 = 10*(7-1), 10*(7-1)+10
+    r_stack = tau_stack - (Y_stack @ a_known_full)     # 去掉 1..6 贡献, r_stack is (T*n,)
+    X7_stack = Y_stack[:, s7:e7]                       # 只保留 link7 的10列, (T*n, 10)
+
+    XtX7 = X7_stack.T @ X7_stack
+    cond7 = np.linalg.cond(XtX7)
+    lam7 = 1e-6 if cond7 < 1e6 else 1e-4
+    a7_hat = np.linalg.solve(XtX7 + lam7*np.eye(10), X7_stack.T @ r_stack)
+
+    a7_true = true_params_all[7]
+    abs_err7 = np.abs(a7_hat - a7_true)
+    rel_err7 = np.where(a7_true != 0, 100*np.abs((a7_hat - a7_true)/a7_true), np.nan)
+
+    print(f"[diag] cond(X7^T X7) = {cond7:.3e}   ridge λ = {lam7}")
+    print("\n[Part1] link7 params:")
+    print("  a7_true:", np.round(a7_true, 6))
+    print("  a7_hat :", np.round(a7_hat, 6))
+    print("  abs err:", np.round(abs_err7, 6))
+    print("  rel  % :", np.round(rel_err7, 2))
+    print(f"  mean |rel|% = {np.nanmean(rel_err7):.2f}   max |rel|% = {np.nanmax(rel_err7):.2f}")
+
+    # --- Part 1 力矩预测与指标 ---
+    # a_full_hat_p1 = (links 1-6 true) + (link 7 estimated)
+    a_full_hat_p1 = a_known_full.copy()
+    a_full_hat_p1[s7:e7] = a7_hat
+    
+    # tau_pred_p1_stack = Y @ a_full_hat_p1
+    tau_pred_p1_stack = Y_stack @ a_full_hat_p1
+    tau_pred_p1_mat = np.vstack([Yt @ a_full_hat_p1 for Yt in regressor_all]) # (T, 7)
+    
+    # (T*n,) 向量用于计算总指标
+    rmse_part1 = calculate_rmse(tau_stack, tau_pred_p1_stack)
+    mets1 = regression_metrics(tau_stack, tau_pred_p1_stack, p=10, has_intercept=False) # p=10 自由参数
+    print(f"\n[Part 1] Torque RMSE (all joints) = {rmse_part1:.6f}")
+    print(f"[Part 1] R2 = {mets1['R2']:.6f}  R2_adj = {mets1['R2_adj']:.6f}  F = {mets1['F']:.3f}")
+
+    # --- (可选) 绘制 Link7 参数对比图 (来自 version1) ---
+    labels = [f"p{i+1}" for i in range(10)]
+    x = np.arange(10); width = 0.35
+    fig1, ax1 = plt.subplots(figsize=(10,4))
+    ax1.bar(x - width/2, a7_true, width, label="True (URDF)")
+    ax1.bar(x + width/2, a7_hat,  width, label="Estimated (Part 1)")
+    ax1.set_xticks(x); ax1.set_xticklabels(labels)
+    ax1.set_title("Part 1: Link 7 Parameters True vs Estimated")
+    ax1.grid(True, alpha=0.3); ax1.legend()
+    plt.tight_layout()
+    plt.savefig("part1_link7_param_compare.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part1_link7_param_compare.png"))
+
+    # --- (可选) 绘制 Link7 误差图 (来自 version1) ---
+    fig2, ax2 = plt.subplots(figsize=(10,3.2))
+    ax2.bar(x, abs_err7)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels)
+    ax2.set_title("Part 1: Link 7 Absolute Parameter Errors")
+    ax2.set_ylabel("|Error|"); ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("part1_link7_param_errors.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part1_link7_param_errors.png"))
+
+    # --- 【重点】Part 1 绘图：仅 Joint 7, 三条曲线 ---
+    fig_p1, ax_p1 = plt.subplots(figsize=(12, 5))
+    j = 6 # Joint 7 (0-indexed)
+    
+    # 1. Measured
+    ax_p1.plot(t_axis, tau_true_mat[:, j], label=f"τ{j+1} measured", linewidth=2.0)
+    # 2. Predicted (estimated link7)
+    ax_p1.plot(t_axis, tau_pred_p1_mat[:, j], "r--", label=f"τ{j+1} predicted (estimated link7)")
+    # 3. Predicted (URDF true)
+    ax_p1.plot(t_axis, tau_urdf_mat[:, j], "g:", label=f"τ{j+1} predicted (URDF true)")
+    
+    ax_p1.set_ylabel(f"Joint {j+1} Torque (Nm)")
+    ax_p1.set_xlabel("Time [s]")
+    ax_p1.grid(True, alpha=0.5)
+    ax_p1.legend(loc="upper right", ncol=3, fontsize=10)
+    ax_p1.set_title("Part 1: Joint 7 Torque Comparison")
+    plt.tight_layout()
+    plt.savefig("part1_joint7_torque.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part1_joint7_torque.png"))
+
 
     # ============================================================
     # ===================  PART 2: 全部参数  ======================
@@ -187,46 +301,65 @@ def main():
     abs_err_all = np.abs(a_hat_all - a_true_all)
     rel_err_all = np.where(a_true_all != 0, 100*np.abs((a_hat_all - a_true_all)/a_true_all), np.nan)
 
-    print("\nPer-link error summary (|abs| and rel % by link, grouped in chunks of 10):")
+    print("\n[Part 2] Per-link error summary (|abs| and rel % by link, grouped in chunks of 10):")
     per_link_mean_rel = []
     for i in range(1, 8):
         s = 10*(i-1); e = 10*i
         abs_err_i = abs_err_all[s:e]
         rel_err_i = rel_err_all[s:e]
-        per_link_mean_rel.append(np.nanmean(rel_err_i))
+        mean_rel_i = np.nanmean(rel_err_i)
+        per_link_mean_rel.append(mean_rel_i)
         print(f"\nLink {i}:")
         print("  abs error: ", np.round(abs_err_i, 6))
         print("  rel  %   : ", np.round(rel_err_i, 2))
-        print(f"  mean |rel|%: {np.nanmean(rel_err_i):.2f}   max |rel|%: {np.nanmax(rel_err_i):.2f}")
+        print(f"  mean |rel|%: {mean_rel_i:.2f}   max |rel|%: {np.nanmax(rel_err_i):.2f}")
 
-    # Torque 预测与指标（全部参数）
-    tau_pred_all = Y_stack @ a_hat_all
-    rmse_all = float(np.sqrt(np.mean((tau_pred_all - tau_stack)**2)))
-    mets_all = regression_metrics(tau_stack, tau_pred_all, p=Y_stack.shape[1], has_intercept=False)
-    print(f"\n[Part 2] Torque RMSE = {rmse_all:.6f}")
-    print(f"[Part 2] R2 = {mets_all['R2']:.6f}  R2_adj = {mets_all['R2_adj']:.6f}  F = {mets_all['F']:.3f}")
+    # --- Part 2 Torque 预测与指标 ---
+    # tau_pred_p2_stack = Y @ a_hat_all
+    tau_pred_p2_stack = Y_stack @ a_hat_all
+    tau_pred_p2_mat = np.vstack([Yt @ a_hat_all for Yt in regressor_all]) # (T, 7)
+    
+    mets_all = regression_metrics(tau_stack, tau_pred_p2_stack, p=Y_stack.shape[1], has_intercept=False)
+    print(f"\n[Part 2] Overall Model Metrics (p={Y_stack.shape[1]}):")
+    print(f"  R2 = {mets_all['R2']:.6f}  R2_adj = {mets_all['R2_adj']:.6f}  F = {mets_all['F']:.3f}")
 
-    # 图：Part2 torque 实测 vs 预测
-    tau_true_mat = np.vstack(tau_mes_all)                         # (T, 7)
-    tau_pred_full_mat = np.vstack([Yt @ a_hat_all for Yt in regressor_all])
-    t_axis = np.array(times[:tau_true_mat.shape[0]])
+    # --- 【重点】Part 2: 打印 3 个 RMSE 对比 ---
+    rmse_meas_est = calculate_rmse(tau_stack, tau_pred_p2_stack)
+    rmse_meas_urdf = calculate_rmse(tau_stack, tau_urdf_stack)
+    rmse_est_urdf = calculate_rmse(tau_pred_p2_stack, tau_urdf_stack)
+    
+    print("\n[Part 2] RMSE Comparisons:")
+    print(f"  RMSE(measured, estimated): {rmse_meas_est:.6f}")
+    print(f"  RMSE(measured, URDF)     : {rmse_meas_urdf:.6f}")
+    print(f"  RMSE(estimated, URDF)    : {rmse_est_urdf:.6f}")
 
-    figp2, axp2 = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+
+    # --- 【重点】Part 2 绘图：7 个子图, 三条曲线 ---
+    fig_p2, ax_p2 = plt.subplots(7, 1, figsize=(12, 16), sharex=True)
+    if n == 1: ax_p2 = [ax_p2] # 兼容单个关节
+        
     for j in range(7):
-        ax = axp2[j]
-        ax.plot(t_axis, tau_true_mat[:, j], label=f"τ{j+1} meas")
-        ax.plot(t_axis, tau_pred_full_mat[:, j], "--", label=f"τ{j+1} pred (full)")
-        ax.set_ylabel(f"J{j+1}")
-        ax.grid(True, alpha=0.3)
+        ax = ax_p2[j]
+        # 1. Measured
+        ax.plot(t_axis, tau_true_mat[:, j], label=f"τ{j+1} measured", linewidth=1.5)
+        # 2. Predicted (estimated all)
+        ax.plot(t_axis, tau_pred_p2_mat[:, j], "r--", label=f"τ{j+1} predicted (estimated all)")
+        # 3. Predicted (URDF true)
+        ax.plot(t_axis, tau_urdf_mat[:, j], "g:", label=f"τ{j+1} predicted (URDF true)")
+        
+        ax.set_ylabel(f"J{j+1} Torque (Nm)")
+        ax.grid(True, alpha=0.5)
         if j == 0:
-            ax.legend(loc="upper right", ncol=2, fontsize=8)
-    axp2[-1].set_xlabel("Time [s]")
-    figp2.suptitle("Part 2: Torque prediction (all 70 params) vs measured")
-    plt.tight_layout()
+            ax.legend(loc="upper right", ncol=3, fontsize=9)
+            
+    ax_p2[-1].set_xlabel("Time [s]")
+    fig_p2.suptitle("Part 2: Torque Comparison (All 70 Parameters Estimated)", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98]) # 调整布局为标题留出空间
     plt.savefig("part2_torque.png", dpi=150)
     print("[OK] saved ->", os.path.abspath("part2_torque.png"))
 
-    # 图：Part2 每个 link 的平均相对误差
+
+    # --- (可选) 绘制 Part2 误差图 (来自 version1) ---
     figp2b, axp2b = plt.subplots(figsize=(8,4))
     axp2b.bar(np.arange(1,8), per_link_mean_rel)
     axp2b.set_xlabel("Link index")
@@ -238,96 +371,22 @@ def main():
     plt.savefig("part2_link_mean_rel_errors.png", dpi=150)
     print("[OK] saved ->", os.path.abspath("part2_link_mean_rel_errors.png"))
 
-    # ============================================================
-    # ===================  PART 1: 仅 Link 7  =====================
-    # ============================================================
-    print("\n" + "="*72)
-    print("PART 1: Estimating ONLY link 7 (links 1..6 known)")
-    print("="*72)
-
-    # 构造已知参数向量（1..6 从URDF，7 置0）
-    per_link_params_known = {i: true_params_all[i] for i in range(1, 7)}
-    a_known_full = build_full_param_vector(n, per_link_params_known)
-
-    s7, e7 = 10*(7-1), 10*(7-1)+10
-    r = tau_stack - (Y_stack @ a_known_full)     # 去掉 1..6 贡献
-    X7 = Y_stack[:, s7:e7]                       # 只保留 link7 的10列
-
-    XtX7 = X7.T @ X7
-    cond7 = np.linalg.cond(XtX7)
-    lam7 = 1e-6 if cond7 < 1e6 else 1e-4
-    a7_hat = np.linalg.solve(XtX7 + lam7*np.eye(10), X7.T @ r)
-
-    a7_true = true_params_all[7]
-    abs_err7 = np.abs(a7_hat - a7_true)
-    rel_err7 = np.where(a7_true != 0, 100*np.abs((a7_hat - a7_true)/a7_true), np.nan)
-
-    print(f"[diag] cond(X7^T X7) = {cond7:.3e}   ridge λ = {lam7}")
-    print("\n[Part1] link7 params:")
-    print("  a7_true:", np.round(a7_true, 6))
-    print("  a7_hat :", np.round(a7_hat, 6))
-    print("  abs err:", np.round(abs_err7, 6))
-    print("  mean |rel|% = {:.2f}   max |rel|% = {:.2f}".format(np.nanmean(rel_err7), np.nanmax(rel_err7)))
-
-    # 用 Part1 的 a_full_hat 做力矩预测与指标
-    a_full_hat = a_known_full.copy()
-    a_full_hat[s7:e7] = a7_hat
-    tau_hat_part1 = Y_stack @ a_full_hat
-    rmse_part1 = float(np.sqrt(np.mean((tau_hat_part1 - tau_stack)**2)))
-    mets1 = regression_metrics(tau_stack, tau_hat_part1, p=10, has_intercept=False)
-    print(f"\n[Part 1] Torque RMSE = {rmse_part1:.6f}")
-    print(f"[Part 1] R2 = {mets1['R2']:.6f}  R2_adj = {mets1['R2_adj']:.6f}  F = {mets1['F']:.3f}")
-
-    # 图：Link7 真值 vs 估计
-    labels = [f"p{i+1}" for i in range(10)]
-    x = np.arange(10); width = 0.35
-    fig1, ax1 = plt.subplots(figsize=(10,4))
-    ax1.bar(x - width/2, a7_true, width, label="True")
-    ax1.bar(x + width/2, a7_hat,  width, label="Estimated")
-    ax1.set_xticks(x); ax1.set_xticklabels(labels)
-    ax1.set_title("Link 7 Parameters: True vs Estimated")
-    ax1.grid(True, alpha=0.3); ax1.legend()
-    plt.tight_layout()
-    plt.savefig("link7_param_compare.png", dpi=150)
-    print("[OK] saved ->", os.path.abspath("link7_param_compare.png"))
-
-    # 图：Link7 绝对误差
-    fig2, ax2 = plt.subplots(figsize=(10,3.2))
-    ax2.bar(x, abs_err7)
-    ax2.set_xticks(x); ax2.set_xticklabels(labels)
-    ax2.set_title("Link 7 Absolute Parameter Errors")
-    ax2.set_ylabel("|Error|"); ax2.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("link7_param_errors.png", dpi=150)
-    print("[OK] saved ->", os.path.abspath("link7_param_errors.png"))
-
-    # 图：Part1 torque 实测/预测/误差
-    tau_mat  = np.vstack(tau_mes_all)                         # (T, 7)
-    uhat_mat = np.vstack([Yt @ a_full_hat for Yt in regressor_all])
-    err_mat  = uhat_mat - tau_mat
-    t_axis1 = np.array(times[:tau_mat.shape[0]])
-
-    fig3, axes = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
-    for j in range(7):
-        ax = axes[j]
-        ax.plot(t_axis1, tau_mat[:, j], label=f"τ{j+1} meas")
-        ax.plot(t_axis1, uhat_mat[:, j], linestyle="--", label=f"τ{j+1} pred")
-        ax.plot(t_axis1, err_mat[:, j], linestyle=":", label=f"error τ{j+1}")
-        ax.set_ylabel(f"J{j+1}")
-        ax.grid(True, alpha=0.3)
-        if j == 0:
-            ax.legend(loc="upper right", ncol=3, fontsize=8)
-    axes[-1].set_xlabel("Time [s]")
-    fig3.suptitle("Part 1: Torque prediction & error (Link 7 only)")
-    plt.tight_layout()
-    plt.savefig("part1_torque.png", dpi=150)
-    print("[OK] saved ->", os.path.abspath("part1_torque.png"))
-
     # --- 摘要 ---
-    print("\n===== SUMMARY =====")
-    print(f"Part 1: Link7 mean |rel|% = {np.nanmean(rel_err7):.2f}    RMSE = {rmse_part1:.6f}")
-    print(f"Part 2: All-links mean |rel|% (avg over links) = {np.nanmean(per_link_mean_rel):.2f}    RMSE = {rmse_all:.6f}")
-    print("Saved figures: link7_param_compare.png, link7_param_errors.png, part1_torque.png, part2_torque.png, part2_link_mean_rel_errors.png")
+    print("\n" + "="*72)
+    print("===== SUMMARY =====")
+    print(f"Part 1 (Link 7 only): Mean Rel Err = {np.nanmean(rel_err7):.2f}%   Overall RMSE = {rmse_part1:.6f}")
+    print(f"Part 2 (All links):   Mean Rel Err = {np.nanmean(per_link_mean_rel):.2f}%   Overall RMSE = {rmse_meas_est:.6f}")
+    print("---")
+    print("Part 2 RMSE(measured, URDF):", rmse_meas_urdf)
+    print("Part 2 RMSE(estimated, URDF):", rmse_est_urdf)
+    print("\nSaved main figures (as required by lab):")
+    print(f"  -> {os.path.abspath('part1_joint7_torque.png')}")
+    print(f"  -> {os.path.abspath('part2_torque.png')}")
+    print("\nSaved optional diagnostic figures:")
+    print(f"  -> {os.path.abspath('part1_link7_param_compare.png')}")
+    print(f"  -> {os.path.abspath('part1_link7_param_errors.png')}")
+    print(f"  -> {os.path.abspath('part2_link_mean_rel_errors.png')}")
+    print("="*72)
 
 if __name__ == '__main__':
     main()
