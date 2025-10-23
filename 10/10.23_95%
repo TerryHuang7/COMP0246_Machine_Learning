@@ -1,0 +1,362 @@
+import numpy as np
+import time
+import os
+import matplotlib.pyplot as plt
+from simulation_and_control import pb, MotorCommands, PinWrapper, feedback_lin_ctrl, SinusoidalReference 
+import xml.etree.ElementTree as ET # <-- 1. 为读取 URDF 添加的 import
+
+# ===== 2. 添加的辅助函数 (用于读取URDF和计算指标) ========================
+# (这部分代码保持不变)
+
+def rpy_to_R(roll, pitch, yaw):
+    """ 帮助 'extract_link10_from_urdf' 计算旋转矩阵 """
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rz = np.array([[cy, -sy, 0],[sy, cy, 0],[0, 0, 1]])
+    Ry = np.array([[cp, 0, sp],[0, 1, 0],[-sp, 0, cp]])
+    Rx = np.array([[1, 0, 0],[0, cr, -sr],[0, sr, cr]])
+    return Rz @ Ry @ Rx  # XYZ fixed-axis roll->pitch->yaw
+
+def extract_link10_from_urdf(urdf_path, link_name):
+    """
+    自动从 URDF 文件中读取一个连杆的10个动力学参数。
+    返回 [m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz]
+    """
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    link = None
+    for lk in root.findall('link'):
+        if lk.get('name') == link_name:
+            link = lk
+            break
+    if link is None:
+        raise ValueError(f"连杆 '{link_name}' 在 URDF 文件中未找到。")
+
+    inertial = link.find('inertial')
+    mass_tag = inertial.find('mass')
+    m = float(mass_tag.attrib['value'])
+
+    origin = inertial.find('origin')
+    if origin is not None:
+        xyz = [float(v) for v in origin.attrib.get('xyz', '0 0 0').split()]
+        rpy = [float(v) for v in origin.attrib.get('rpy', '0 0 0').split()]
+    else:
+        xyz = [0.0, 0.0, 0.0]; rpy = [0.0, 0.0, 0.0]
+    cx, cy, cz = xyz
+    R_li = rpy_to_R(*rpy)
+
+    I = inertial.find('inertia').attrib
+    I_in = np.array([[float(I['ixx']), float(I['ixy']), float(I['ixz'])],
+                     [float(I['ixy']), float(I['iyy']), float(I['iyz'])],
+                     [float(I['ixz']), float(I['iyz']), float(I['izz'])]])
+    I_link = R_li @ I_in @ R_li.T
+    Ixx, Ixy, Ixz = I_link[0,0], I_link[0,1], I_link[0,2]
+    Iyy, Iyz, Izz = I_link[1,1], I_link[1,2], I_link[2,2]
+    
+    # 注意：根据 Pinocchio/URDF 的标准，参数a是 [m, m*c] 而不是 [m, c]
+    return np.array([m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz], dtype=float)
+
+def regression_metrics(y, y_hat, p):
+    """
+    计算回归的统计指标 (R2, R2_adj, F-stat)。
+    y: 真实值 (M,)
+    y_hat: 预测值 (M,)
+    p: 自由参数的数量 (e.g., 10 for Part 1, 70 for Part 2)
+    """
+    M = y.size
+    residual = y - y_hat
+    RSS = float(residual @ residual) # 残差平方和
+    TSS = float(((y - y.mean()) ** 2).sum()) if M > 0 else np.nan # 总平方和
+    R2 = 1.0 - (RSS / TSS if TSS > 0 else np.nan)
+    # 调整 R2
+    R2_adj = 1.0 - ((RSS / max(M - p, 1)) / (TSS / max(M - 1, 1)) if TSS > 0 else np.nan)
+    # F 统计量
+    num = (TSS - RSS) / p if TSS > RSS else 0.0
+    den = (RSS / max(M - p - 1, 1))
+    F = num / den if den > 0 else np.nan
+    return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F, "M": M, "p": p}
+
+# ===== 辅助函数结束 ==================================================
+
+
+def main():
+    # Configuration for the simulation
+    conf_file_name = "pandaconfig.json"  # Configuration file for the robot
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    sim = pb.SimInterface(conf_file_name, conf_file_path_ext=cur_dir)  # Initialize simulation interface
+
+    # ... (从 'ext_names' 到 'kd = 100' 的所有设置保持不变) ...
+    ext_names = sim.getNameActiveJoints()
+    ext_names = np.expand_dims(np.array(ext_names), axis=0)
+    source_names = ["pybullet"]
+    dyn_model = PinWrapper(conf_file_name, "pybullet", ext_names, source_names, False, 0, cur_dir)
+    num_joints = dyn_model.getNumberofActuatedJoints()
+    print(f"Initial joint angles: {sim.GetInitMotorAngles()}")
+    amplitudes = [np.pi/4, np.pi/6, np.pi/4, np.pi/4, np.pi/4, np.pi/4, np.pi/4]
+    frequencies = [0.4, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4]
+    amplitude = np.array(amplitudes)
+    frequency = np.array(frequencies)
+    ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles())
+    time_step = sim.GetTimeStep()
+    current_time = 0
+    max_time = 10  # seconds
+    cmd = MotorCommands()
+    kp = 1000
+    kd = 100
+
+    # Initialize data storage
+    tau_mes_all = []
+    regressor_all = []
+    times = []
+
+    print(f"\n--- 开始数据采集 (t=0 到 {max_time}s) ---")
+    print(f"--- (将跳过 t=0 到 t=1.0s 的预热数据) ---")
+
+    # ===== [!!! 关键修改 !!!] =====
+    # Data collection loop (修正了 Y 和 tau 的时间对齐问题)
+    while current_time < max_time:
+        
+        # --- 时刻 t ---
+        
+        # 1. 测量 t 时刻的所有状态
+        q_mes = sim.GetMotorAngles(0)
+        qd_mes = sim.GetMotorVelocities(0)
+        qdd_mes = sim.ComputeMotorAccelerationTMinusOne(0)
+        
+        # 2. 【关键修复】在 t 时刻测量 t 时刻的力矩
+        #    (这个力矩是上一个循环的 tau_cmd 作用的结果)
+        tau_mes = sim.GetMotorTorques(0)
+        
+        # 3. 计算 t 时刻的回归器 Y(t)
+        Y_t = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)
+
+        # 4. 存储对齐的数据 (Y(t), tau(t))
+        #    并且只存储 t > 1.0s 的“平稳”数据 (集成了预热逻辑)
+        if current_time > 1.0:
+            regressor_all.append(Y_t)
+            tau_mes_all.append(np.asarray(tau_mes))
+            times.append(current_time)
+        
+        # 5. 计算 t 时刻的期望轨迹 (用于下一个指令)
+        q_d, qd_d = ref.get_values(current_time)  # Desired position and velocity
+        
+        # 6. 计算 t 时刻的控制指令 (将被用于 t+1)
+        tau_cmd = feedback_lin_ctrl(dyn_model, q_mes, qd_mes, q_d, qd_d, kp, kd)  # Zero torque command
+        
+        # 7. 应用 t 时刻的指令, 仿真器前进到 t+1 时刻
+        cmd.SetControlCmd(tau_cmd, ["torque"]*num_joints)  # Set the torque com
+        sim.Step(cmd, "torque")
+
+        # (退出逻辑保持不变)
+        if dyn_model.visualizer: 
+            for index in range(len(sim.bot)):
+                q = sim.GetMotorAngles(index)
+                dyn_model.DisplayModel(q)
+        keys = sim.GetPyBulletClient().getKeyboardEvents()
+        qKey = ord('q')
+        if qKey in keys and keys[qKey] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
+            break
+
+        current_time += time_step
+        
+        # 打印频率 (来自截图 的建议)
+        if int(current_time * 1000) % 1000 == 0: # 每整秒打印一次
+            print(f"Current time in seconds: {current_time:.2f}")
+
+    # ===== 预热代码块现在不再需要了 =====
+    # (因为我们已经在循环内部用 if current_time > 1.0 实现了)
+    print(f"\n--- 数据采集完成。总共采集了 {len(times)} 个平稳数据点。 ---")
+    # =========================================================================
+
+
+    # --- TODO 2: Stack all data and compute parameters 'a' for all joints (Part 2) (已完成) ---
+    # (这部分及之后的所有代码都保持不变)
+    Y_stack = np.vstack(regressor_all) # (N*7, 70)
+    u_stack = np.hstack(tau_mes_all)   # (N*7,)
+    
+    # Part 2: 估算所有 70 个参数
+    a_est_all, residuals_all, rank_all, s_all = np.linalg.lstsq(Y_stack, u_stack, rcond=None)
+    
+    print("\n--- (Part 2) 估算的全部70个参数 (a_est_all): ---")
+    print(f"Shape of a_est_all: {a_est_all.shape}")
+    print(f"Regression Rank (Part 2): {rank_all} / 70")
+    # print(np.round(a_est_all, 4)) # 取消注释以查看70个估算参数
+    
+
+    # --- [新代码块] 读取所有 7 个连杆的真实参数 (a_true_all) ---
+    print("\n--- 正在从 URDF 自动读取全部 7 个连杆的真实参数 ---")
+    urdf_path = os.path.join(cur_dir, "models/panda_description/panda.urdf")
+    link_names_all_7 = ["panda_link1","panda_link2","panda_link3",
+                        "panda_link4","panda_link5","panda_link6", "panda_link7"]
+    
+    params_list_all_7 = []
+    for name in link_names_all_7:
+        a10 = extract_link10_from_urdf(urdf_path, name)
+        params_list_all_7.append(a10)
+    
+    a_true_all = np.concatenate(params_list_all_7)
+    print(f"成功读取 {len(params_list_all_7)} 个连杆, a_true_all.shape: {a_true_all.shape}")
+    assert a_true_all.shape == (70,), "a_true_all 必须有 70 个元素"
+    # --- [新代码块结束] ---
+
+
+    
+    # --- TODO 3: Reshape for last joint and find its parameters (Part 1) (已完成) ---
+    print("\n--- (Part 1) 正在准备仅针对连杆 7 的回归 ---")
+    
+    # 1. 从 a_true_all 中切片获取已知的参数
+    a_known_1_to_6 = a_true_all[0:60] # (60,)
+    
+    # 2. [验证打印] 打印连杆 1-6 的真实参数
+    print(f"  > 验证: 打印连杆 1-6 的真实参数 [m, m*c, I]:")
+    for i in range(6):  # 循环 6 次
+        link_number = i + 1
+        link_params = a_known_1_to_6[i*10 : (i+1)*10]
+        print(f"    Link {link_number}: {np.round(link_params, 3)}")
+    
+    # 3. 拆分 Y_stack 矩阵
+    Y_stack_1_to_6 = Y_stack[:, 0:60] # (N*7, 60)
+    Y_stack_7 = Y_stack[:, 60:70] # (N*7, 10)
+    
+    # 4. 计算 u_modified (u_modified = u_stack - Y_1-6 * a_1-6)
+    u_known_part = Y_stack_1_to_6 @ a_known_1_to_6
+    u_modified = u_stack - u_known_part
+    
+    # 5. 求解 a_7 (Y_7 * a_7 = u_modified)
+    a_est_7, residuals_7, rank_7, s_7 = np.linalg.lstsq(Y_stack_7, u_modified, rcond=None)
+    
+    print("\n--- (Part 1) 估算的连杆 7 (末端执行器) 的10个参数: ---")
+    print(f"Regression Rank (Part 1): {rank_7} / 10")
+    print(np.round(a_est_7, 4))
+    
+    # 6. [额外验证] 比较估算的 a_est_7 和真实的 a_true_7
+    a_true_7 = a_true_all[60:70]
+    print("\n--- (Part 1) 连杆 7 估算值 vs 真实值对比: ---")
+    print(f"  估算值 (a_est_7): {np.round(a_est_7, 4)}")
+    print(f"  真实值 (a_true_7): {np.round(a_true_7, 4)}")
+    print(f"  误差 (est - true): {np.round(a_est_7 - a_true_7, 4)}")
+    # --- [TODO 3 结束] ---
+
+  
+    
+    # --- TODO 4: Compute the metrics (R-squared adjusted etc...) (已完成) ---
+    print("\n" + "="*72)
+    print("--- (Part 1) 回归指标 (仅估算连杆 7) ---")
+    # 重新构建 Part 1 的完整估算向量
+    a_est_part1 = a_true_all.copy()
+    a_est_part1[60:70] = a_est_7
+    # 计算 Part 1 的总预测力矩
+    u_hat_part1 = Y_stack @ a_est_part1
+    # 计算指标, p=10 (因为只有10个自由参数)
+    metrics_part1 = regression_metrics(u_stack, u_hat_part1, p=10)
+    for k, v in metrics_part1.items():
+        print(f"  {k}: {v:.4e}")
+
+    print("\n--- (Part 2) 回归指标 (估算所有连杆) ---")
+    # 计算 Part 2 的总预测力矩
+    u_hat_part2 = Y_stack @ a_est_all
+    # 计算指标, p=70 (因为有70个自由参数)
+    metrics_part2 = regression_metrics(u_stack, u_hat_part2, p=70)
+    for k, v in metrics_part2.items():
+        print(f"  {k}: {v:.4e}")
+    
+    print("="*72)
+    # --- [TODO 4 结束] ---
+
+   
+    # --- TODO 5: Plot the torque prediction error for each joint (optional) (已完成) ---
+    # [--- 补齐开始 (修改为两个独立的对比图) ---]
+    
+    print("\n--- 正在生成两个独立的力矩对比图 (Part 1 和 Part 2) ---")
+    
+    # 1. 计算 "URDF 理想力矩" (这是新的一行)
+    # 这是根据 URDF 真实参数和实际运动算出的 "理想" 力矩
+    u_hat_urdf = Y_stack @ a_true_all
+
+    # 2. 将所有力矩向量 (N*7,) 变形为 (N, 7) 以便绘图
+    num_samples = len(times)
+    num_joints = dyn_model.getNumberofActuatedJoints()
+    
+    # (u_stack, u_hat_part1, u_hat_part2 已经存在)
+    
+    tau_measured_ts = u_stack.reshape(num_samples, num_joints)
+    tau_urdf_ts = u_hat_urdf.reshape(num_samples, num_joints)
+    tau_pred_part1_ts = u_hat_part1.reshape(num_samples, num_joints)
+    tau_pred_part2_ts = u_hat_part2.reshape(num_samples, num_joints)
+    
+    # 3. 创建时间轴
+    time_vec = np.array(times)
+
+    # ===== 图 1: Part 1 对比 ================================================
+    plt.figure(figsize=(14, 20)) # 第一个图窗
+    plt.suptitle("Torque Comparison (Part 1): Measured vs. URDF Ideal vs. Predicted", fontsize=16)
+    
+    for i in range(num_joints):
+        plt.subplot(num_joints, 1, i + 1)
+        
+        # 绘制 3 条线
+        plt.plot(time_vec, tau_measured_ts[:, i], 
+                 label=f"Measured (sim)", color='black', linewidth=2.5, alpha=0.7)
+        
+        plt.plot(time_vec, tau_urdf_ts[:, i], 
+                 label=f"URDF Ideal (a_true_all)", color='red', linestyle=':', linewidth=2)
+                 
+        plt.plot(time_vec, tau_pred_part1_ts[:, i], 
+                 label=f"Predicted (Part 1)", color='blue', linestyle='--', alpha=0.8)
+                 
+        plt.ylabel(f"Joint {i+1} Torque (Nm)")
+        plt.grid(True, linestyle=':', alpha=0.6)
+        
+        # 把图例放在第一个子图上
+        if i == 0:
+            plt.legend(loc='upper right', fontsize=10)
+
+    plt.xlabel("Time (s)")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    
+    # 保存图像 1
+    plot_filename_part1 = "torque_comparison_part1.png"
+    plt.savefig(plot_filename_part1)
+    print(f"--- 图像 1 已保存到 {plot_filename_part1} ---")
+    
+    # ===== 图 2: Part 2 对比 ================================================
+    plt.figure(figsize=(14, 20)) # 第二个图窗
+    plt.suptitle("Torque Comparison (Part 2): Measured vs. URDF Ideal vs. Predicted", fontsize=16)
+    
+    for i in range(num_joints):
+        plt.subplot(num_joints, 1, i + 1)
+        
+        # 绘制 3 条线
+        plt.plot(time_vec, tau_measured_ts[:, i], 
+                 label=f"Measured (sim)", color='black', linewidth=2.5, alpha=0.7)
+        
+        plt.plot(time_vec, tau_urdf_ts[:, i], 
+                 label=f"URDF Ideal (a_true_all)", color='red', linestyle=':', linewidth=2)
+                 
+        plt.plot(time_vec, tau_pred_part2_ts[:, i], 
+                 label=f"Predicted (Part 2)", color='green', linestyle='-.', alpha=0.8)
+                 
+        plt.ylabel(f"Joint {i+1} Torque (Nm)")
+        plt.grid(True, linestyle=':', alpha=0.6)
+        
+        # 把图例放在第一个子图上
+        if i == 0:
+            plt.legend(loc='upper right', fontsize=10)
+
+    plt.xlabel("Time (s)")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    
+    # 保存图像 2
+    plot_filename_part2 = "torque_comparison_part2.png"
+    plt.savefig(plot_filename_part2)
+    print(f"--- 图像 2 已保存到 {plot_filename_part2} ---")
+    
+    plt.show() # 如果你想让它们弹窗显示, 你可能需要在这里调用 plt.show()
+    
+    # [--- 补齐结束 ---]
+
+    
+
+if __name__ == '__main__':
+    main()
